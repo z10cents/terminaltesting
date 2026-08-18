@@ -3,7 +3,7 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
@@ -23,13 +23,20 @@ use polyoxide_data::types::TimePeriod;
 use polyoxide_gamma::Gamma;
 use serde::Deserialize;
 use tokio_stream::wrappers::ReceiverStream;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    set_header::SetResponseHeaderLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
+
+const KALSHI_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 
 #[derive(Clone)]
 struct AppState {
     gamma: Arc<Gamma>,
     clob: Arc<Clob>,
     data: Arc<DataApi>,
+    http: reqwest::Client,
 }
 
 #[tokio::main]
@@ -54,11 +61,15 @@ async fn main() -> anyhow::Result<()> {
         .timeout_ms(15_000)
         .max_concurrent(8)
         .build()?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
 
     let state = AppState {
         gamma: Arc::new(gamma),
         clob: Arc::new(clob),
         data: Arc::new(data),
+        http,
     };
 
     let app = Router::new()
@@ -79,10 +90,47 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/user/:addr/value", get(user_value))
         .route("/api/user/:addr/trades", get(user_trades))
         .route("/api/user/:addr/activity", get(user_activity))
+        .route("/api/kalshi/events", get(kalshi_events))
+        .route("/api/kalshi/markets", get(kalshi_markets))
+        .route("/api/kalshi/markets/:ticker", get(kalshi_market))
+        .route("/api/kalshi/book/:ticker", get(kalshi_book))
+        .route("/api/kalshi/trades/:ticker", get(kalshi_market_trades_proxy))
         .with_state(state)
-        .layer(CorsLayer::permissive())
-        // Hard cap per request — upstream SDK has its own 15s timeout but
-        // axum needs its own, otherwise a stuck upstream pins the tower task.
+        .fallback_service(
+            ServeDir::new(
+                std::env::var("FRONTEND_DIST")
+                    .unwrap_or_else(|_| "frontend/dist".to_string()),
+            )
+            .not_found_service(ServeFile::new(format!(
+                "{}/index.html",
+                std::env::var("FRONTEND_DIST")
+                    .unwrap_or_else(|_| "frontend/dist".to_string())
+            ))),
+        )
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("geolocation=(), camera=(), microphone=(), payment=(), usb=()"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains; preload"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https: wss:; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"),
+        ))
         .layer(TimeoutLayer::new(Duration::from_secs(20)))
         .layer(TraceLayer::new_for_http());
 
@@ -105,8 +153,6 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Accept only the shapes Polymarket ids come in — avoids forwarding
-/// path-traversal / arbitrary characters into upstream URLs.
 fn valid_id(s: &str, max_len: usize) -> bool {
     !s.is_empty()
         && s.len() <= max_len
@@ -117,6 +163,20 @@ fn valid_id(s: &str, max_len: usize) -> bool {
 fn ensure_id(s: &str, max_len: usize) -> Result<(), AppError> {
     if !valid_id(s, max_len) {
         return Err(AppError(anyhow::anyhow!("invalid identifier")));
+    }
+    Ok(())
+}
+
+fn valid_kalshi_ticker(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn ensure_kalshi_ticker(s: &str) -> Result<(), AppError> {
+    if !valid_kalshi_ticker(s) {
+        return Err(AppError(anyhow::anyhow!("invalid kalshi ticker")));
     }
     Ok(())
 }
@@ -140,7 +200,7 @@ async fn list_markets(
         .gamma
         .markets()
         .list()
-        .limit(q.limit.unwrap_or(50))
+        .limit(q.limit.unwrap_or(50).min(200))
         .offset(q.offset.unwrap_or(0))
         .order(q.order.as_deref().unwrap_or("volume24hr"))
         .ascending(false)
@@ -209,7 +269,7 @@ async fn list_events(
         .gamma
         .events()
         .list()
-        .limit(q.limit.unwrap_or(30))
+        .limit(q.limit.unwrap_or(30).min(200))
         .offset(q.offset.unwrap_or(0))
         .active(q.active.unwrap_or(true))
         .order("volume24hr")
@@ -284,8 +344,6 @@ async fn stream_book(
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
 
     tokio::spawn(async move {
-        // Bounded reconnect: give up after ~20 attempts so a dead token
-        // doesn't leave a background task looping forever.
         const MAX_ATTEMPTS: u32 = 20;
         let mut attempts: u32 = 0;
         let mut backoff = Duration::from_secs(1);
@@ -299,9 +357,6 @@ async fn stream_book(
                     "ws giving up after {} attempts",
                     attempts
                 );
-                // Tell the client we're done on purpose so native
-                // EventSource stops auto-reconnecting. The browser treats
-                // this as a normal message type it can branch on.
                 let _ = tx
                     .send(Event::default().event("done").data("max_attempts"))
                     .await;
@@ -464,7 +519,7 @@ async fn leaderboard(
         .category(parse_category(q.category.as_deref()))
         .time_period(parse_period(q.period.as_deref()))
         .order_by(parse_order_by(q.order_by.as_deref()))
-        .limit(q.limit.unwrap_or(50))
+        .limit(q.limit.unwrap_or(50).min(200))
         .offset(q.offset.unwrap_or(0))
         .send()
         .await?;
@@ -554,6 +609,91 @@ async fn user_activity(
     Ok(Json(serde_json::to_value(resp)?))
 }
 
+// ── Kalshi proxy ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct KalshiPageQuery {
+    limit: Option<u32>,
+    cursor: Option<String>,
+    status: Option<String>,
+}
+
+async fn kalshi_events(
+    State(s): State<AppState>,
+    Query(q): Query<KalshiPageQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = q.limit.unwrap_or(200).min(1000);
+    let status = q.status.as_deref().unwrap_or("open");
+    let mut url = format!(
+        "{KALSHI_BASE}/events?limit={limit}&status={status}&with_nested_markets=true"
+    );
+    if let Some(c) = q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        url.push_str(&format!("&cursor={c}"));
+    }
+    let resp = s.http.get(&url).send().await?.error_for_status()?;
+    Ok(Json(resp.json().await?))
+}
+
+async fn kalshi_markets(
+    State(s): State<AppState>,
+    Query(q): Query<KalshiPageQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = q.limit.unwrap_or(200).min(1000);
+    let status = q.status.as_deref().unwrap_or("open");
+    let mut url = format!("{KALSHI_BASE}/markets?limit={limit}&status={status}");
+    if let Some(c) = q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        url.push_str(&format!("&cursor={c}"));
+    }
+    let resp = s.http.get(&url).send().await?.error_for_status()?;
+    Ok(Json(resp.json().await?))
+}
+
+async fn kalshi_market(
+    State(s): State<AppState>,
+    Path(ticker): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_kalshi_ticker(&ticker)?;
+    let resp = s
+        .http
+        .get(format!("{KALSHI_BASE}/markets/{ticker}"))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(Json(resp.json().await?))
+}
+
+async fn kalshi_book(
+    State(s): State<AppState>,
+    Path(ticker): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_kalshi_ticker(&ticker)?;
+    let resp = s
+        .http
+        .get(format!("{KALSHI_BASE}/markets/{ticker}/orderbook"))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(Json(resp.json().await?))
+}
+
+async fn kalshi_market_trades_proxy(
+    State(s): State<AppState>,
+    Path(ticker): Path<String>,
+    Query(q): Query<KalshiPageQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_kalshi_ticker(&ticker)?;
+    let limit = q.limit.unwrap_or(50).min(200);
+    let resp = s
+        .http
+        .get(format!("{KALSHI_BASE}/markets/{ticker}/trades?limit={limit}"))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(Json(resp.json().await?))
+}
+
+// ── Error handling ────────────────────────────────────────────────────────────
+
 struct AppError(anyhow::Error);
 
 impl<E: Into<anyhow::Error>> From<E> for AppError {
@@ -564,11 +704,8 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        // Log the full chain internally; don't leak it to clients.
         tracing::error!("request error: {:#}", self.0);
         let msg = self.0.to_string();
-        // Distinguish validation errors (safe to echo) from upstream/internal
-        // errors (generic message only).
         let is_validation = msg.starts_with("invalid ") || msg.contains("too long");
         let status = if is_validation {
             StatusCode::BAD_REQUEST

@@ -24,6 +24,7 @@ import {
 const CLOB_HOST = 'https://clob.polymarket.com'
 
 const LS_CREDS_PREFIX = 'humanplane:polymarket:creds:v1:'
+const credsMem = new Map<string, Creds>()
 
 type Creds = { key: string; secret: string; passphrase: string }
 
@@ -48,15 +49,7 @@ function loadCreds(
   funder: string,
   sigType: number
 ): Creds | null {
-  try {
-    const raw = localStorage.getItem(credsKey(eoa, funder, sigType))
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    if (parsed?.key && parsed?.secret && parsed?.passphrase) return parsed
-    return null
-  } catch {
-    return null
-  }
+  return credsMem.get(credsKey(eoa, funder, sigType)) ?? null
 }
 
 function saveCreds(
@@ -65,14 +58,7 @@ function saveCreds(
   sigType: number,
   creds: Creds
 ) {
-  try {
-    localStorage.setItem(
-      credsKey(eoa, funder, sigType),
-      JSON.stringify(creds)
-    )
-  } catch {
-    /* quota */
-  }
+  credsMem.set(credsKey(eoa, funder, sigType), creds)
 }
 
 /**
@@ -80,17 +66,12 @@ function saveCreds(
  * Called on wallet disconnect or account-switch.
  */
 export function clearCredsForEoa(eoa: string) {
-  try {
-    const prefix = `${LS_CREDS_PREFIX}${eoa.toLowerCase()}:`
-    const toRemove: string[] = []
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i)
-      if (k && k.startsWith(prefix)) toRemove.push(k)
-    }
-    for (const k of toRemove) localStorage.removeItem(k)
-  } catch {
-    /* noop */
+  const prefix = `${LS_CREDS_PREFIX}${eoa.toLowerCase()}:`
+  const toRemove: string[] = []
+  for (const key of credsMem.keys()) {
+    if (key.startsWith(prefix)) toRemove.push(key)
   }
+  for (const key of toRemove) credsMem.delete(key)
 }
 
 /**

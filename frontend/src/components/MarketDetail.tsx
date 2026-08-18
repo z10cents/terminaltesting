@@ -4,7 +4,7 @@ import type { Event, Market, IntervalKey } from '../lib/api'
 import { api, INTERVALS } from '../lib/api'
 import { createLiveBook, type SortedLevel } from '../lib/stream'
 import { favorites } from '../lib/favorites'
-import { fmtPct, fmtUSDFull, fmtDate, relativeTime } from '../lib/format'
+import { fmtUSDFull, fmtDate, relativeTime } from '../lib/format'
 import { OrderBook } from './OrderBook'
 import { PriceChart } from './PriceChart'
 import { Avatar } from './Avatar'
@@ -51,30 +51,26 @@ export function MarketDetail(props: Props) {
     refetchOnWindowFocus: false,
   }))
 
-  const snapSorted = createMemo<{
-    bids: SortedLevel[]
-    asks: SortedLevel[]
-  } | null>(() => {
-    const b = snapshotBookQuery.data
-    if (!b) return null
-    const bids = b.bids
-      .map((l) => ({ price: Number(l.price), size: Number(l.size) }))
-      .sort((x, y) => y.price - x.price)
-    const asks = b.asks
-      .map((l) => ({ price: Number(l.price), size: Number(l.size) }))
-      .sort((x, y) => x.price - y.price)
-    return { bids, asks }
-  })
+  const snapSorted = createMemo<{ bids: SortedLevel[]; asks: SortedLevel[] } | null>(
+    () => {
+      const b = snapshotBookQuery.data
+      if (!b) return null
+      const bids = b.bids
+        .map((l) => ({ price: Number(l.price), size: Number(l.size) }))
+        .sort((x, y) => y.price - x.price)
+      const asks = b.asks
+        .map((l) => ({ price: Number(l.price), size: Number(l.size) }))
+        .sort((x, y) => x.price - y.price)
+      return { bids, asks }
+    }
+  )
 
   const bidsView = (): SortedLevel[] =>
     live.version() > 0 ? live.bids() : (snapSorted()?.bids ?? [])
   const asksView = (): SortedLevel[] =>
     live.version() > 0 ? live.asks() : (snapSorted()?.asks ?? [])
-  const haveBook = () =>
-    live.version() > 0 || snapshotBookQuery.data != null
+  const haveBook = () => live.version() > 0 || snapshotBookQuery.data != null
 
-  // Live-preferred top-of-book — falls back to market metadata when book not
-  // yet loaded. Keeps the stats strip ticking along with the order book.
   const bestBid = () => bidsView()[0]?.price ?? props.market.bestBid ?? null
   const bestAsk = () => asksView()[0]?.price ?? props.market.bestAsk ?? null
   const spreadCents = () => {
@@ -84,8 +80,6 @@ export function MarketDetail(props: Props) {
     return (a - b) * 100
   }
   const liveYesPrice = () => {
-    // Prefer the last-trade price from the live stream; else mid-of-book;
-    // else stale outcomePrices metadata.
     const lt = live.lastTrade()?.price
     if (lt != null) return lt
     const b = bestBid()
@@ -94,12 +88,6 @@ export function MarketDetail(props: Props) {
     return props.market.outcomePrices[0] ?? null
   }
 
-  // Live tick passed to the chart. Prefer `last_trade` prices (actual
-  // executions); otherwise fall back to mid-of-book so the chart still moves
-  // on quiet markets whose best bid/ask shift without trades.
-  //
-  // We throttle by bumping only when the value or second-resolution time has
-  // changed, so lightweight-charts isn't hit on every book micro-update.
   let lastTickKey = ''
   const liveTick = () => {
     const lt = live.lastTrade()
@@ -124,116 +112,132 @@ export function MarketDetail(props: Props) {
   }
 
   const image = () =>
-    props.market.image ||
-    props.market.icon ||
-    props.event?.image ||
-    props.event?.icon
+    props.market.image || props.market.icon || props.event?.image || props.event?.icon
 
   const yesLabel = () => props.market.outcomes[0] ?? 'YES'
+  const noLabel = () => props.market.outcomes[1] ?? 'NO'
   const fav = () => favorites.isMarket(props.market.id)
+  const noPrice = () => {
+    const y = liveYesPrice()
+    return y != null ? 1 - y : null
+  }
 
   return (
-    <div class="flex h-full min-h-0 flex-col overflow-hidden">
-      {/* Breadcrumb */}
-      <div class="section-head">
-        <div class="flex min-w-0 items-center gap-3 overflow-hidden">
-          <Show when={props.event}>
-            {(e) => (
-              <span class="eyebrow-bright truncate">{e().title}</span>
-            )}
-          </Show>
-          <Show when={props.market.endDate}>
-            <span class="text-border-3">·</span>
-            <span class="tabular-nums">
-              {fmtDate(props.market.endDate)} ({relativeTime(props.market.endDate)})
-            </span>
-          </Show>
-        </div>
-        <div class="flex shrink-0 items-center gap-3">
-          <Show when={live.connected()}>
-            <span class="flex items-center gap-1.5 text-up">
-              <span class="live-dot inline-block h-1.5 w-1.5 bg-up" />
-              <span>LIVE</span>
-            </span>
-          </Show>
-          <button
-            onClick={() => favorites.toggleMarket(props.market.id)}
-            class={
-              'text-[13px] leading-none hover:text-text-bright ' +
-              (fav() ? 'text-text-bright' : 'text-text-dim')
-            }
-            title={fav() ? 'un-favorite (f)' : 'favorite (f)'}
-          >
-            {fav() ? '★' : '☆'}
-          </button>
-        </div>
-      </div>
-
-      {/* Hero */}
-      <div class="flex shrink-0 items-start gap-4 border-b border-border-2 px-4 py-4">
-        <Avatar
-          src={image()}
-          seed={props.event?.ticker || props.market.question}
-          size="lg"
-        />
-        <div class="min-w-0 flex-1">
-          <h1 class="text-[13px] font-semibold leading-snug text-text-bright">
-            {props.market.question}
-          </h1>
-          <div class="mt-1.5 eyebrow">{yesLabel()} probability</div>
-        </div>
-        <div class="shrink-0 text-right leading-none">
-          <div
-            class={
-              'tabular-nums text-[26px] font-bold ' +
-              (liveYesPrice() != null && liveYesPrice()! > 0.5
-                ? 'text-up'
-                : 'text-text-bright')
-            }
-          >
-            {liveYesPrice() != null
-              ? `${(liveYesPrice()! * 100).toFixed(0)}¢`
-              : '—'}
-          </div>
-          <Show when={props.market.oneDayPriceChange != null}>
-            <div
-              class={
-                'mt-2 tabular-nums text-[11px] font-semibold ' +
-                (props.market.oneDayPriceChange! >= 0 ? 'text-up' : 'text-down')
-              }
-            >
-              {props.market.oneDayPriceChange! >= 0 ? '+' : ''}
-              {fmtPct(props.market.oneDayPriceChange, 1)} 24h
+    <div>
+      {/* Hero card */}
+      <div class="card mb-4 overflow-hidden">
+        {/* Title row */}
+        <div class="flex items-start gap-4 px-5 py-4" style={{ 'border-bottom': '1px solid var(--color-border)' }}>
+          <Avatar
+            src={image()}
+            seed={props.event?.ticker || props.market.question}
+            size="lg"
+          />
+          <div class="min-w-0 flex-1">
+            <div class="flex items-start gap-2">
+              <h1 class="flex-1 text-[15px] font-bold leading-snug text-text-bright">
+                {props.market.question}
+              </h1>
+              <button
+                onClick={() => favorites.toggleMarket(props.market.id)}
+                class="mt-0.5 shrink-0 text-[16px] leading-none"
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  color: fav() ? '#f59e0b' : 'var(--color-text-dimmer)',
+                }}
+                title={fav() ? 'un-favorite (f)' : 'favorite (f)'}
+              >
+                {fav() ? '★' : '☆'}
+              </button>
             </div>
-          </Show>
-        </div>
-      </div>
+            <Show when={props.event}>
+              {(e) => (
+                <div class="mt-1 text-[11px] text-text-dim">{e().title}</div>
+              )}
+            </Show>
+            <Show when={props.market.endDate}>
+              <div class="mt-1 text-[11px] text-text-dim">
+                Closes {fmtDate(props.market.endDate)} · {relativeTime(props.market.endDate)}
+              </div>
+            </Show>
+          </div>
 
-      {/* Stat strip — best bid/ask and spread follow the live book. */}
-      <div class="grid shrink-0 grid-cols-5 border-b border-border-2">
-        <Stat label="24h Vol" value={fmtUSDFull(props.market.volume24hr)} />
-        <Stat label="Liquidity" value={fmtUSDFull(props.market.liquidityNum)} />
-        <Stat
-          label="Best Bid"
-          value={bestBid() != null ? `${(bestBid()! * 100).toFixed(1)}¢` : '—'}
-          tone={bestBid() != null ? 'up' : undefined}
-        />
-        <Stat
-          label="Best Ask"
-          value={bestAsk() != null ? `${(bestAsk()! * 100).toFixed(1)}¢` : '—'}
-          tone={bestAsk() != null ? 'down' : undefined}
-        />
-        <Stat
-          label="Spread"
-          value={spreadCents() != null ? `${spreadCents()!.toFixed(2)}¢` : '—'}
-        />
+          {/* Live YES/NO price buttons */}
+          <div class="flex shrink-0 gap-2">
+            <LargePrice
+              label={yesLabel()}
+              price={liveYesPrice()}
+              change={props.market.oneDayPriceChange ?? null}
+              color="#16a34a"
+              bgColor="#f0fdf4"
+              borderColor="#bbf7d0"
+            />
+            <LargePrice
+              label={noLabel()}
+              price={noPrice()}
+              change={props.market.oneDayPriceChange != null ? -(props.market.oneDayPriceChange) : null}
+              color="#dc2626"
+              bgColor="#fef2f2"
+              borderColor="#fecaca"
+            />
+          </div>
+        </div>
+
+        {/* Stats strip */}
+        <div class="grid grid-cols-5" style={{ 'border-bottom': '1px solid var(--color-border)' }}>
+          <StatCell label="24h Vol" value={fmtUSDFull(props.market.volume24hr)} />
+          <StatCell label="Liquidity" value={fmtUSDFull(props.market.liquidityNum)} />
+          <StatCell
+            label="Best Bid"
+            value={bestBid() != null ? `${(bestBid()! * 100).toFixed(1)}¢` : '—'}
+            color="#16a34a"
+          />
+          <StatCell
+            label="Best Ask"
+            value={bestAsk() != null ? `${(bestAsk()! * 100).toFixed(1)}¢` : '—'}
+            color="#dc2626"
+          />
+          <StatCell
+            label="Spread"
+            value={spreadCents() != null ? `${spreadCents()!.toFixed(2)}¢` : '—'}
+          />
+        </div>
+
+        {/* Live indicator */}
+        <Show when={live.connected()}>
+          <div
+            class="flex h-7 items-center gap-2 px-5 text-[11px] font-medium"
+            style={{ color: 'var(--color-up)', background: '#f0fdf4', 'border-bottom': '1px solid #bbf7d0' }}
+          >
+            <span class="live-dot inline-block h-1.5 w-1.5 rounded-full bg-up" />
+            <span>Live order book</span>
+            <Show when={live.lastTrade()}>
+              {(t) => (
+                <span class="ml-2 text-text-dim">
+                  Last trade:{' '}
+                  <span class="font-semibold tabular-nums" style={{ color: t().side === 'BUY' ? '#16a34a' : '#dc2626' }}>
+                    {(t().price * 100).toFixed(1)}¢
+                  </span>
+                </span>
+              )}
+            </Show>
+          </div>
+        </Show>
       </div>
 
       {/* Chart + right panel */}
-      <div class="flex min-h-0 flex-1 flex-col lg:flex-row">
-        <div class="flex min-h-[340px] min-w-0 flex-1 flex-col border-b border-border-2 lg:border-b-0 lg:border-r">
-          <div class="flex h-8 shrink-0 items-center justify-between gap-3 border-b border-border px-4 eyebrow">
-            <span class="shrink-0">price · {yesLabel()}</span>
+      <div class="flex flex-col gap-4 lg:flex-row lg:items-start">
+        {/* Chart card */}
+        <div class="card min-w-0 flex-1 overflow-hidden">
+          <div
+            class="flex h-10 items-center justify-between gap-3 px-4"
+            style={{ 'border-bottom': '1px solid var(--color-border-2)' }}
+          >
+            <span class="text-[11px] font-medium text-text-dim uppercase tracking-wide">
+              {yesLabel()} Price
+            </span>
             <div class="segmented">
               <For each={INTERVALS}>
                 {(iv) => (
@@ -246,34 +250,17 @@ export function MarketDetail(props: Props) {
                 )}
               </For>
             </div>
-            <Show
-              when={live.lastTrade()}
-              fallback={<span class="w-28 shrink-0 text-right">—</span>}
-            >
-              {(t) => (
-                <span
-                  class={
-                    'w-28 shrink-0 text-right normal-case ' +
-                    (t().side === 'BUY' ? 'text-up' : 'text-down')
-                  }
-                  style={{ 'letter-spacing': 'normal' }}
-                >
-                  last <span class="tabular-nums">{(t().price * 100).toFixed(2)}¢</span>
-                </span>
-              )}
-            </Show>
           </div>
-          <div class="relative min-h-0 flex-1">
+          <div class="h-72">
             <Show
-              when={
-                historyQuery.data?.history?.length
-                  ? historyQuery.data.history
-                  : undefined
-              }
+              when={historyQuery.data?.history?.length ? historyQuery.data.history : undefined}
               keyed
               fallback={
-                <div class="flex h-full items-center justify-center eyebrow">
-                  {historyQuery.isLoading ? 'loading…' : 'no history'}
+                <div
+                  class="flex h-full items-center justify-center text-[12px]"
+                  style={{ color: 'var(--color-text-dim)' }}
+                >
+                  {historyQuery.isLoading ? 'loading chart…' : 'no price history'}
                 </div>
               }
             >
@@ -282,9 +269,15 @@ export function MarketDetail(props: Props) {
           </div>
         </div>
 
-        {/* Right panel: tabbed Book / Tape / Holders */}
-        <div class="flex min-h-0 flex-col lg:w-[360px] lg:shrink-0">
-          <div class="flex h-8 shrink-0 items-center justify-between border-b border-border px-3 eyebrow">
+        {/* Right panel: book / tape / holders / trade */}
+        <div
+          class="card w-full overflow-hidden lg:w-[340px] lg:shrink-0"
+          style={{ height: '352px' }}
+        >
+          <div
+            class="flex h-10 items-center justify-between px-3"
+            style={{ 'border-bottom': '1px solid var(--color-border-2)' }}
+          >
             <div class="segmented">
               <For each={RIGHT_TABS}>
                 {(t) => (
@@ -298,12 +291,12 @@ export function MarketDetail(props: Props) {
               </For>
             </div>
             <Show when={rightTab() === 'book' && haveBook()}>
-              <span class="tabular-nums">
+              <span class="text-[11px] tabular-nums text-text-dim">
                 {bidsView().length}b / {asksView().length}a
               </span>
             </Show>
           </div>
-          <div class="min-h-0 flex-1 overflow-hidden">
+          <div style={{ height: 'calc(100% - 40px)', overflow: 'hidden' }}>
             <Show when={rightTab() === 'book'}>
               <OrderBook bids={bidsView()} asks={asksView()} levels={14} />
             </Show>
@@ -314,11 +307,7 @@ export function MarketDetail(props: Props) {
               <TopHolders market={props.market} />
             </Show>
             <Show when={rightTab() === 'trade'}>
-              <TradePanel
-                market={props.market}
-                bids={bidsView}
-                asks={asksView}
-              />
+              <TradePanel market={props.market} bids={bidsView} asks={asksView} />
             </Show>
           </div>
         </div>
@@ -326,16 +315,24 @@ export function MarketDetail(props: Props) {
 
       {/* Resolution criteria */}
       <Show when={props.market.description}>
-        <div class="shrink-0 border-t border-border-2">
+        <div class="card mt-4 overflow-hidden">
           <button
             onClick={() => setDescOpen((v) => !v)}
-            class="flex h-8 w-full cursor-pointer items-center justify-between border-b border-border px-4 eyebrow hover:text-text-bright"
+            class="flex h-10 w-full items-center justify-between px-5 text-left"
+            style={{
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              'border-bottom': descOpen() ? '1px solid var(--color-border)' : 'none',
+            }}
           >
-            <span>resolution criteria</span>
-            <span class="text-[14px] leading-none">{descOpen() ? '−' : '+'}</span>
+            <span class="text-[12px] font-medium text-text-bright">Resolution Criteria</span>
+            <span class="text-[16px] leading-none text-text-dim">
+              {descOpen() ? '−' : '+'}
+            </span>
           </button>
           <Show when={descOpen()}>
-            <div class="min-h-[80px] max-h-[25vh] overflow-y-auto px-4 py-3 text-[11px] leading-relaxed text-text">
+            <div class="max-h-48 overflow-y-auto px-5 py-4 text-[12px] leading-relaxed text-text">
               <p class="whitespace-pre-wrap">{props.market.description}</p>
             </div>
           </Show>
@@ -345,19 +342,58 @@ export function MarketDetail(props: Props) {
   )
 }
 
-function Stat(props: { label: string; value: string; tone?: 'up' | 'down' }) {
+function LargePrice(props: {
+  label: string
+  price: number | null
+  change: number | null
+  color: string
+  bgColor: string
+  borderColor: string
+}) {
   return (
-    <div class="border-r border-border last:border-r-0 px-4 py-2.5">
-      <div class="eyebrow">{props.label}</div>
+    <div
+      class="flex w-[100px] flex-col items-center rounded-xl py-3"
+      style={{
+        background: props.bgColor,
+        border: `1px solid ${props.borderColor}`,
+      }}
+    >
+      <span
+        class="text-[10px] font-bold uppercase tracking-widest"
+        style={{ color: props.color }}
+      >
+        {props.label}
+      </span>
+      <span
+        class="mt-1 text-[20px] font-bold tabular-nums leading-none"
+        style={{ color: props.color }}
+      >
+        {props.price != null ? `${(props.price * 100).toFixed(0)}¢` : '—'}
+      </span>
+      <Show when={props.change != null && props.change !== 0}>
+        <span
+          class="mt-1 text-[10px] tabular-nums"
+          style={{ color: props.color, opacity: 0.7 }}
+        >
+          {(props.change! * 100) > 0 ? '+' : ''}{(props.change! * 100).toFixed(1)}%
+        </span>
+      </Show>
+    </div>
+  )
+}
+
+function StatCell(props: { label: string; value: string; color?: string }) {
+  return (
+    <div
+      class="px-5 py-3"
+      style={{ 'border-right': '1px solid var(--color-border)' }}
+    >
+      <div class="text-[10px] font-medium uppercase tracking-wide text-text-dim">
+        {props.label}
+      </div>
       <div
-        class={
-          'mt-1 truncate tabular-nums text-[12px] font-semibold text-text-bright ' +
-          (props.tone === 'up'
-            ? '!text-up'
-            : props.tone === 'down'
-              ? '!text-down'
-              : '')
-        }
+        class="mt-1 text-[13px] font-semibold tabular-nums"
+        style={{ color: props.color ?? 'var(--color-text-bright)' }}
       >
         {props.value}
       </div>

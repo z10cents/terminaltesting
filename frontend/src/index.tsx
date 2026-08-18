@@ -25,6 +25,8 @@ render(
         <Route path="/market/:slug" />
         <Route path="/traders" />
         <Route path="/trader/:addr" />
+        <Route path="/kalshi" />
+        <Route path="/kalshi/market/:ticker" />
         <Route path="*" component={() => <Navigate href="/markets" />} />
       </Router>
     </QueryClientProvider>

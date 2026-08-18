@@ -14,7 +14,7 @@ axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "fs", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
@@ -26,3 +26,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 polyoxide-gamma = "0.13"
 polyoxide-data = "0.13"
 polyoxide-clob = { version = "0.13", features = ["ws"], default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

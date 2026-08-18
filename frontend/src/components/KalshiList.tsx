@@ -1,43 +1,65 @@
-import { For, Show, createMemo } from 'solid-js'
-import type { Event, Market } from '../lib/api'
-import { favorites } from '../lib/favorites'
-import { fmtUSD } from '../lib/format'
+import { For, Show, createMemo, createSignal } from 'solid-js'
+import { type KalshiEvent, type KalshiMarket, fmtKalshiVol } from '../lib/kalshi-api'
 import { Avatar } from './Avatar'
 
 type Props = {
-  events: Event[]
-  onSelect: (m: Market) => void
+  events: KalshiEvent[]
+  onSelect: (m: KalshiMarket) => void
   filter: string
   onFilterChange: (v: string) => void
   hasMore: boolean
   loadingMore: boolean
   onLoadMore: () => void
-  searching: boolean
   ref?: (el: HTMLInputElement) => void
 }
 
-export function MarketList(props: Props) {
-  const filtered = createMemo<Event[]>(() => {
+function eventVol(e: KalshiEvent) {
+  return e.markets.reduce((s, m) => s + parseFloat(m.volume_24h_fp || '0'), 0)
+}
+
+export function KalshiList(props: Props) {
+  const [category, setCategory] = createSignal('All')
+
+  const categories = createMemo(() => {
+    const cats = new Set<string>()
+    props.events.forEach((e) => { if (e.category) cats.add(e.category) })
+    return ['All', ...Array.from(cats).sort()]
+  })
+
+  const filtered = createMemo<KalshiEvent[]>(() => {
     const q = props.filter.trim().toLowerCase()
-    if (!q) return props.events
-    return props.events
-      .map((e) => {
-        const evMatch =
-          e.title.toLowerCase().includes(q) ||
-          (e.ticker ?? '').toLowerCase().includes(q)
-        const matchingMarkets = e.markets.filter(
-          (m) => evMatch || m.question.toLowerCase().includes(q)
-        )
-        return { ...e, markets: matchingMarkets }
-      })
-      .filter((e) => e.markets.length > 0)
+    const cat = category()
+
+    let evs = props.events
+
+    if (cat !== 'All') {
+      evs = evs.filter((e) => e.category === cat)
+    }
+
+    if (q) {
+      evs = evs
+        .map((e) => {
+          const evMatch =
+            e.title.toLowerCase().includes(q) ||
+            e.event_ticker.toLowerCase().includes(q)
+          const matchingMarkets = e.markets.filter(
+            (m) =>
+              evMatch ||
+              m.title.toLowerCase().includes(q) ||
+              m.ticker.toLowerCase().includes(q)
+          )
+          return { ...e, markets: matchingMarkets }
+        })
+        .filter((e) => e.markets.length > 0)
+    }
+
+    return [...evs].sort((a, b) => eventVol(b) - eventVol(a))
   })
 
   const totalMarkets = createMemo(() =>
     filtered().reduce((n, e) => n + e.markets.length, 0)
   )
 
-  // Infinite scroll trigger via IntersectionObserver
   const observer = new IntersectionObserver(
     (entries) => {
       if (entries[0]?.isIntersecting && props.hasMore && !props.loadingMore) {
@@ -51,7 +73,7 @@ export function MarketList(props: Props) {
     <div>
       {/* Search bar */}
       <div
-        class="mb-4 flex items-center gap-3 rounded-xl border bg-panel px-4 py-2.5"
+        class="mb-3 flex items-center gap-3 rounded-xl border bg-panel px-4 py-2.5"
         style={{ 'border-color': 'var(--color-border-2)' }}
       >
         <svg
@@ -68,7 +90,7 @@ export function MarketList(props: Props) {
         </svg>
         <input
           type="text"
-          placeholder="Search events & markets… (/)"
+          placeholder="Search Kalshi events & markets… (/)"
           ref={(el) => props.ref?.(el)}
           value={props.filter}
           onInput={(e) => props.onFilterChange(e.currentTarget.value)}
@@ -85,20 +107,45 @@ export function MarketList(props: Props) {
         </Show>
       </div>
 
+      {/* Category tabs */}
+      <Show when={categories().length > 1}>
+        <div
+          class="mb-3 flex gap-1.5 overflow-x-auto pb-1"
+          style={{ 'scrollbar-width': 'none' }}
+        >
+          <For each={categories()}>
+            {(cat) => (
+              <button
+                onClick={() => setCategory(cat)}
+                class="shrink-0 rounded-full px-3 py-1 text-[12px] font-medium transition-colors"
+                style={
+                  category() === cat
+                    ? {
+                        background: 'var(--color-text-bright)',
+                        color: 'var(--color-panel)',
+                        border: '1px solid var(--color-text-bright)',
+                        cursor: 'pointer',
+                      }
+                    : {
+                        background: 'var(--color-panel)',
+                        color: 'var(--color-text-dim)',
+                        border: '1px solid var(--color-border-2)',
+                        cursor: 'pointer',
+                      }
+                }
+              >
+                {cat}
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+
       {/* Count strip */}
       <div class="mb-3 flex items-center justify-between">
-        <Show
-          when={props.searching}
-          fallback={
-            <span class="eyebrow">
-              {filtered().length} events · {totalMarkets()} markets
-            </span>
-          }
-        >
-          <span class="eyebrow eyebrow-bright">
-            {filtered().length} events matching "{props.filter}"
-          </span>
-        </Show>
+        <span class="eyebrow">
+          {filtered().length} events · {totalMarkets()} markets · sorted by 24h vol
+        </span>
         <Show when={props.loadingMore}>
           <span class="eyebrow">loading…</span>
         </Show>
@@ -109,10 +156,7 @@ export function MarketList(props: Props) {
         <div class="space-y-2">
           <For each={Array.from({ length: 6 })}>
             {() => (
-              <div
-                class="card overflow-hidden"
-                style={{ background: 'var(--color-panel)' }}
-              >
+              <div class="card overflow-hidden">
                 <div class="flex items-center gap-3 px-4 py-3">
                   <div class="skeleton h-9 w-9 shrink-0 rounded-lg" />
                   <div class="flex-1 space-y-2">
@@ -132,7 +176,7 @@ export function MarketList(props: Props) {
       {/* Event cards */}
       <div class="space-y-2">
         <For each={filtered()}>
-          {(event) => <EventCard event={event} onSelect={props.onSelect} />}
+          {(event) => <KalshiEventCard event={event} onSelect={props.onSelect} />}
         </For>
       </div>
 
@@ -153,66 +197,52 @@ export function MarketList(props: Props) {
   )
 }
 
-function EventCard(props: { event: Event; onSelect: (m: Market) => void }) {
-  const vol24h = () => props.event.volume24hr ?? 0
+function KalshiEventCard(props: { event: KalshiEvent; onSelect: (m: KalshiMarket) => void }) {
+  const totalVol = () => eventVol(props.event)
 
   return (
-    <div
-      class="card overflow-hidden"
-      style={{ transition: 'box-shadow 0.1s' }}
-    >
-      {/* Card header */}
+    <div class="card overflow-hidden">
       <div
         class="flex items-center gap-3 px-4 py-3"
         style={{ 'border-bottom': '1px solid var(--color-border)' }}
       >
-        <Avatar
-          src={props.event.image ?? props.event.icon}
-          seed={props.event.ticker || props.event.title}
-          size="md"
-        />
+        <Avatar src={undefined} seed={props.event.event_ticker} size="md" />
         <div class="min-w-0 flex-1">
           <div class="truncate text-[13px] font-semibold text-text-bright">
             {props.event.title}
           </div>
           <div class="mt-0.5 flex items-center gap-2 text-[11px] text-text-dim">
-            <span class="tabular-nums">{fmtUSD(vol24h())} 24h vol</span>
+            <span class="tabular-nums">{fmtKalshiVol(totalVol())} 24h vol</span>
             <span>·</span>
             <span>{props.event.markets.length} outcomes</span>
+            <Show when={props.event.category}>
+              <span>·</span>
+              <span>{props.event.category}</span>
+            </Show>
           </div>
         </div>
       </div>
-
-      {/* Market rows */}
       <For each={props.event.markets}>
         {(market) => (
-          <MarketRow
-            market={market}
-            onSelect={() => props.onSelect(market)}
-          />
+          <KalshiMarketRow market={market} onSelect={() => props.onSelect(market)} />
         )}
       </For>
     </div>
   )
 }
 
-function MarketRow(props: { market: Market; onSelect: () => void }) {
-  const yesPrice = () => props.market.outcomePrices[0] ?? null
-  const noPrice = () => {
-    const y = yesPrice()
-    return y != null ? 1 - y : null
-  }
-  const change = () => props.market.oneDayPriceChange ?? 0
-  const fav = () => favorites.isMarket(props.market.id)
+function KalshiMarketRow(props: { market: KalshiMarket; onSelect: () => void }) {
+  const yesPrice = () => parseFloat(props.market.yes_ask_dollars)
+  const noPrice = () => parseFloat(props.market.no_ask_dollars)
 
   return (
     <button
       onClick={props.onSelect}
-      class="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors"
+      class="flex w-full items-center gap-3 px-4 py-2.5 text-left"
       style={{
+        border: 'none',
         'border-bottom': '1px solid var(--color-border)',
         background: 'none',
-        border: 'none',
         cursor: 'pointer',
       }}
       onMouseEnter={(e) => {
@@ -222,36 +252,18 @@ function MarketRow(props: { market: Market; onSelect: () => void }) {
         ;(e.currentTarget as HTMLElement).style.background = 'none'
       }}
     >
-      {/* Favorite star */}
-      <Show when={fav()}>
-        <span class="text-[10px] text-text-bright">★</span>
-      </Show>
-
-      {/* Question */}
       <span class="min-w-0 flex-1 truncate text-[12px] text-text">
-        {props.market.groupItemTitle || props.market.question}
+        {props.market.title}
       </span>
-
-      {/* 24h change */}
-      <Show when={change() !== 0}>
-        <span
-          class="shrink-0 text-[11px] font-medium tabular-nums"
-          style={{ color: change() > 0 ? 'var(--color-up)' : 'var(--color-down)' }}
-        >
-          {change() > 0 ? '+' : ''}{(change() * 100).toFixed(1)}%
-        </span>
-      </Show>
-
-      {/* YES / NO price buttons */}
       <div class="flex shrink-0 gap-1.5">
-        <PriceBtn
+        <KPriceBtn
           label="YES"
           price={yesPrice()}
           color="#16a34a"
           bgColor="#f0fdf4"
           borderColor="#bbf7d0"
         />
-        <PriceBtn
+        <KPriceBtn
           label="NO"
           price={noPrice()}
           color="#dc2626"
@@ -263,9 +275,9 @@ function MarketRow(props: { market: Market; onSelect: () => void }) {
   )
 }
 
-function PriceBtn(props: {
+function KPriceBtn(props: {
   label: string
-  price: number | null
+  price: number
   color: string
   bgColor: string
   borderColor: string
@@ -273,10 +285,7 @@ function PriceBtn(props: {
   return (
     <div
       class="flex w-[68px] flex-col items-center rounded-lg py-1.5"
-      style={{
-        background: props.bgColor,
-        border: `1px solid ${props.borderColor}`,
-      }}
+      style={{ background: props.bgColor, border: `1px solid ${props.borderColor}` }}
     >
       <span
         class="text-[9px] font-bold uppercase tracking-widest"
@@ -288,7 +297,7 @@ function PriceBtn(props: {
         class="mt-0.5 text-[13px] font-bold tabular-nums"
         style={{ color: props.color }}
       >
-        {props.price != null ? `${(props.price * 100).toFixed(0)}¢` : '—'}
+        {isNaN(props.price) ? '—' : `${Math.round(props.price * 100)}¢`}
       </span>
     </div>
   )
